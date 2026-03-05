@@ -1,0 +1,12 @@
+torch
+torchaudio
+torchvision
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+kagglehub>=0.3.13
+PyYAML
+scipy
+soundfile
