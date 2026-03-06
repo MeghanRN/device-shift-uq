@@ -25,8 +25,12 @@ def collect(model, loader, device):
     L,Y,D,S = [],[],[],[]
     with torch.no_grad():
         for x,y,dom,sid in tqdm(loader, leave=False):
+            if x.ndim == 5:
+                x = x.squeeze(2)
+            if x.ndim != 4:
+                raise RuntimeError(f"Expected x to be 4D (B,1,F,T) but got {tuple(x.shape)}")
             x = x.to(device)
-            L.append(model(x).cpu())
+            L.append(model(x).cpu())            
             Y.append(y)
             D.extend(list(dom)); S.extend(list(sid))
     return torch.cat(L,0).numpy(), torch.cat(Y,0).numpy(), np.array(D), np.array(S)

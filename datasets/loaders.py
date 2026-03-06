@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 from typing import Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
+from scipy.io import loadmat, wavfile
+from scipy.signal import resample_poly
 from torch.utils.data import DataLoader, Dataset
 
 from datasets.paths import default_paths
@@ -20,24 +23,92 @@ from features.tf_repr import (
 
 
 def ensure_cft(x: torch.Tensor) -> torch.Tensor:
-    """
-    Force spectrogram into (C,F,T) with C=1.
-    """
     if not isinstance(x, torch.Tensor):
         x = torch.tensor(x)
 
-    # common cases: (F,T) or (1,F,T) or (1,1,F,T)
     if x.ndim == 4 and x.shape[0] == 1 and x.shape[1] == 1:
-        x = x.squeeze(0)  # (1,1,F,T) -> (1,F,T)
+        x = x.squeeze(0)
 
     if x.ndim == 2:
-        x = x.unsqueeze(0)  # (F,T) -> (1,F,T)
+        x = x.unsqueeze(0)
 
     if x.ndim != 3:
         raise RuntimeError(f"Expected (C,F,T), got {tuple(x.shape)}")
 
-    # If someone produced C!=1, keep it but still (C,F,T)
     return x
+
+
+def _normalize_audio_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+
+    if np.issubdtype(x.dtype, np.integer):
+        info = np.iinfo(x.dtype)
+        x = x.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        x = x.astype(np.float32)
+
+    if x.ndim == 2:
+        if x.shape[0] < x.shape[1]:
+            x = x.mean(axis=0)
+        else:
+            x = x.mean(axis=1)
+
+    return x.astype(np.float32)
+
+
+def _robust_read_wav(path: str) -> tuple[np.ndarray, int]:
+    try:
+        wav_np, sr = sf.read(path, dtype="float32", always_2d=True)
+        wav_np = wav_np.mean(axis=1)
+        return wav_np.astype(np.float32), int(sr)
+    except Exception:
+        pass
+
+    sr, wav_np = wavfile.read(path)
+    wav_np = _normalize_audio_np(wav_np)
+    return wav_np.astype(np.float32), int(sr)
+
+
+def _resample_if_needed(wav: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    if sr_in == sr_out:
+        return wav.astype(np.float32)
+    wav_rs = resample_poly(wav, sr_out, sr_in)
+    return wav_rs.astype(np.float32)
+
+
+def _read_cwru_mat(path: str, preferred_channel: str = "DE") -> tuple[np.ndarray, int]:
+    mat = loadmat(path)
+
+    order = [preferred_channel]
+    for ch in ["DE", "FE", "BA"]:
+        if ch not in order:
+            order.append(ch)
+
+    chosen = None
+    for ch in order:
+        suffix = f"{ch}_time"
+        for k in mat.keys():
+            if k.endswith(suffix):
+                chosen = k
+                break
+        if chosen is not None:
+            break
+
+    if chosen is None:
+        for k, v in mat.items():
+            if k.startswith("__"):
+                continue
+            arr = np.asarray(v)
+            if arr.size > 100 and np.issubdtype(arr.dtype, np.number):
+                chosen = k
+                break
+
+    if chosen is None:
+        raise RuntimeError(f"Could not find a usable signal in {path}")
+
+    sig = np.asarray(mat[chosen]).squeeze().astype(np.float32)
+    sr = 12000
+    return sig, sr
 
 
 class GenericTFDataset(Dataset):
@@ -68,34 +139,33 @@ class GenericTFDataset(Dataset):
         domain = str(r.get("domain", ""))
         sid = str(r.get("sample_id", i))
 
-        if not path.lower().endswith(".wav"):
-            raise RuntimeError(f"Non-wav file encountered: {path}")
+        if path.lower().endswith(".wav"):
+            wav_np, sr = _robust_read_wav(path)
+            wav_np = _resample_if_needed(wav_np, sr, self.audio_sr)
+            wav = torch.from_numpy(wav_np)
 
-        wav_np, sr = sf.read(path, dtype="float32", always_2d=True)  # (T,C)
-        wav = torch.from_numpy(wav_np).T  # (C,T)
-        wav = wav.mean(dim=0)  # (T,)
+        elif path.lower().endswith(".mat"):
+            preferred = domain if domain in {"DE", "FE", "BA"} else "DE"
+            sig_np, sr = _read_cwru_mat(path, preferred_channel=preferred)            
+            sig_np = _resample_if_needed(sig_np, sr, self.audio_sr)
+            wav = torch.from_numpy(sig_np)
 
-        if int(sr) != self.audio_sr:
-            raise RuntimeError(
-                f"Sample rate mismatch for {path}: got {sr}, expected {self.audio_sr}"
-            )
+        else:
+            raise RuntimeError(f"Unsupported file type: {path}")
 
         wav = pad_or_crop_1d(wav, int(self.audio_sr * self.target_seconds))
-
-        x = self.transform(wav)          # expect (1,F,T) or (F,T) or (1,1,F,T)
-        x = ensure_cft(x)                # -> (1,F,T)
+        x = self.transform(wav)
+        x = ensure_cft(x)
         x = pad_or_crop_2d(x, self.target_frames)
-        # force x to (C,F,T) with C=1 (remove any extra singleton dims)
-        while x.ndim > 3 and x.shape[0] == 1:
-            x = x.squeeze(0)   # (1,1,F,T)->(1,F,T) or (1,F,T)->(F,T) won't happen here
-        if x.ndim == 2:
-            x = x.unsqueeze(0) # (F,T)->(1,F,T)
 
+        while x.ndim > 3 and x.shape[0] == 1:
+            x = x.squeeze(0)
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
         if x.ndim != 3:
             raise RuntimeError(f"Expected (1,F,T) but got {tuple(x.shape)}")
-        x = ensure_cft(x)                # re-check
+        x = ensure_cft(x)
 
-        # Labels
         if self.task_type == "single_label":
             y = torch.tensor(int(r["y"]), dtype=torch.long)
         else:
@@ -106,7 +176,7 @@ class GenericTFDataset(Dataset):
         return x, y, domain, sid
 
 
-def load_task(dataset: str) -> Tuple[str, int, int, object, int, Optional[Sequence[str]]]:
+def load_task(dataset: str) -> Tuple[str, int, int, object, Optional[int], Optional[Sequence[str]]]:
     paths = default_paths(dataset)
     splits = paths.splits
 
@@ -151,8 +221,13 @@ def make_loaders(dataset: str, batch_size: int = 64, num_workers: int = 0):
 
     train_ds, val_ds, id_ds, sh_ds = ds("train"), ds("val"), ds("test_id"), ds("test_shift")
 
-    # CPU windows: pin_memory False
     def dl(d: Dataset, shuffle: bool = False) -> DataLoader:
-        return DataLoader(d, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=False)
+        return DataLoader(
+            d,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=False,
+        )
 
     return task_type, num_outputs, dl(train_ds, True), dl(val_ds), dl(id_ds), dl(sh_ds)
